@@ -106,9 +106,8 @@ process CREATE_SPARSE_GRM {
     if (workflow.containerEngine == 'singularity' && !params.singularity_pull_docker_container) {
         container "${params.saige_grm_container}"
     } else {
-        container "${params.saige_docker}"
+        container "${params.saige_grm_docker}"
     }    
-
 
     input:
         tuple path(plink_bim), path(plink_bed), path(plink_fam)
@@ -251,7 +250,8 @@ process SAIGE_S2_CIS {
                     --markers_per_chunk=${params.SAIGE.markers_per_chunk} ${mode}   2>&1)
 
                 if [ \$? -ne 0 ]; then
-                    echo "step2_tests_qtl.R command failed" >&2
+                    echo "step2_tests_qtl.R command failed with error:" >&2
+                    echo "\$warning_output" >&2
                     return  # Skip the rest of the function and go to the next iteration
                 fi
 
@@ -482,6 +482,43 @@ process AGGREGATE_QTL_ALLVARS{
         """
 }
 
+process CONCAT_QTL_ALLVARS_BY_EXP {
+    tag { exp }
+    scratch false
+    label 'process_low'
+
+    if (workflow.containerEngine == 'singularity' && !params.singularity_pull_docker_container) {
+        container "${params.eqtl_container}"
+    } else {
+        container "${params.eqtl_docker}"
+    }
+
+    publishDir path: "${params.outdir}/Saige_eQTLS/${exp}",
+               mode: "${params.copy_mode}",
+               overwrite: true
+
+    input:
+        tuple val(exp), path(all_var_files)
+
+    output:
+        path("${exp}__all_chroms_all_vars_genes.tsv.gz")
+
+    script:
+        """
+        first_file=true
+
+        for f in ${all_var_files.collect { it.getName() }.join(' ')}; do
+            if [ "\$first_file" = true ]; then
+                gzip -dc "\$f" >> ${exp}__all_chroms_all_vars_genes.tsv
+                first_file=false
+            else
+                gzip -dc "\$f" | tail -n +2 >> ${exp}__all_chroms_all_vars_genes.tsv
+            fi
+        done
+        gzip ${exp}__all_chroms_all_vars_genes.tsv
+        """
+}
+
 process PHENOTYPE_PCs{
     // label 'process_medium'
     tag { sanitized_columns }
@@ -606,6 +643,7 @@ process H5AD_TO_SAIGE_FORMAT {
             --sample_id ${params.sample_column} \
             --general_file_dir ./output_agg \
             --nperc \$nperc \
+            --gtf_gene_identifier ${params.gtf_gene_identifier} \
             --min ${params.n_min_cells} \
             --scale_covariates \$scale_covariates \
             --expression_pca \$expression_pca --cell_percentage_threshold ${params.cell_percentage_threshold} \
@@ -688,7 +726,7 @@ process DETERMINE_TSS_AND_TEST_REGIONS {
     script:
     """
         echo 'Lets prepeare the regions file'
-        prepeare_Saige_regions_for_cis.py --annotation_file ${annotation_file} --genes ${genes_list} --gtf_type ${params.gtf_type} --window ${params.windowSize}
+        prepeare_Saige_regions_for_cis.py --annotation_file ${annotation_file} --genes ${genes_list} --gtf_type ${params.gtf_type} --window ${params.windowSize} --gtf_gene_identifier ${params.gtf_gene_identifier}
     """
 }
 
@@ -740,7 +778,16 @@ workflow SAIGE_qtls{
             return second.collect { [first, it] }
         }
 
-        result.combine(pheno, by: 0).set{pheno_chunk}
+        result.combine(pheno, by: 0).set { all_chunks }
+
+        if (params.SAIGE.testing){
+            all_chunks
+            .first()
+            .set { pheno_chunk }
+        } else{
+            all_chunks.set { pheno_chunk }
+        }
+        
 
         
         Channel.fromList(params.SAIGE.chromosomes_to_test)
@@ -800,5 +847,16 @@ workflow SAIGE_qtls{
         AGGREGATE_QTL_ALLVARS(SAIGE_S2_for_aggregation.groupTuple(by: 0))
         AGGREGATE_ACAT_RESULTS(SAIGE_S3_for_aggregation_ACAT.groupTuple(by: 0))
         // CONDITIONAL_QTL(SAIGE_QVAL_COR.out.for_conditioning)
+
+        AGGREGATE_QTL_ALLVARS.out.all
+            .map { group, file -> 
+                def parts = group.split('__')
+                def exp = parts[-3]
+                tuple(exp, file)
+            }
+            .groupTuple()
+            .set { grouped_all_var_files }
+
+        CONCAT_QTL_ALLVARS_BY_EXP(grouped_all_var_files)
 
 }
